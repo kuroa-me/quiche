@@ -29,6 +29,8 @@
 //! This module provides some utility functions that are common to quiche
 //! applications.
 
+use crate::proxy::*;
+
 use std::io::prelude::*;
 
 use std::collections::HashMap;
@@ -44,6 +46,7 @@ use std::cell::RefCell;
 
 use std::path;
 
+use mio::net::UdpSocket;
 use ring::rand::SecureRandom;
 
 use quiche::ConnectionId;
@@ -92,6 +95,8 @@ pub struct Client {
     pub partial_requests: std::collections::HashMap<u64, PartialRequest>,
 
     pub partial_responses: std::collections::HashMap<u64, PartialResponse>,
+
+    pub masque: std::collections::HashMap<u64, Http3DgramProxy>,
 
     pub max_datagram_size: usize,
 
@@ -348,7 +353,8 @@ pub trait HttpConn {
     fn handle_requests(
         &mut self, conn: &mut quiche::Connection,
         partial_requests: &mut HashMap<u64, PartialRequest>,
-        partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
+        partial_responses: &mut HashMap<u64, PartialResponse>,
+        connect_proxies: &mut HashMap<u64, Http3DgramProxy>, root: &str,
         index: &str, buf: &mut [u8],
     ) -> quiche::h3::Result<()>;
 
@@ -381,7 +387,12 @@ struct Http3Request {
 }
 
 type Http3ResponseBuilderResult = std::result::Result<
-    (Vec<quiche::h3::Header>, Vec<u8>, Vec<u8>),
+    (
+        Vec<quiche::h3::Header>,
+        Vec<u8>,
+        Vec<u8>,
+        Option<Http3DgramProxy>,
+    ),
     (u64, String),
 >;
 
@@ -565,7 +576,8 @@ impl HttpConn for Http09Conn {
     fn handle_requests(
         &mut self, conn: &mut quiche::Connection,
         partial_requests: &mut HashMap<u64, PartialRequest>,
-        partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
+        partial_responses: &mut HashMap<u64, PartialResponse>,
+        _connect_proxies: &mut HashMap<u64, Http3DgramProxy>, root: &str,
         index: &str, buf: &mut [u8],
     ) -> quiche::h3::Result<()> {
         // Process all readable streams.
@@ -756,6 +768,7 @@ pub struct Http3Conn {
     sent_body_bytes: HashMap<u64, usize>,
     dump_json: bool,
     dgram_sender: Option<Http3DgramSender>,
+    dgram_proxies: HashMap<u64, Option<UdpSocket>>,
     output_sink: Rc<RefCell<dyn FnMut(String)>>,
 }
 
@@ -768,6 +781,7 @@ impl Http3Conn {
         qpack_max_table_capacity: Option<u64>,
         qpack_blocked_streams: Option<u64>, dump_json: Option<usize>,
         dgram_sender: Option<Http3DgramSender>,
+        dgram_proxies: HashMap<u64, Option<UdpSocket>>,
         output_sink: Rc<RefCell<dyn FnMut(String)>>,
     ) -> Box<dyn HttpConn> {
         let mut reqs = Vec::new();
@@ -848,6 +862,7 @@ impl Http3Conn {
             body: body.as_ref().map(|b| b.to_vec()),
             sent_body_bytes: HashMap::new(),
             dump_json: dump_json.is_some(),
+            dgram_proxies,
             dgram_sender,
             output_sink,
         };
@@ -860,6 +875,7 @@ impl Http3Conn {
         qpack_max_table_capacity: Option<u64>,
         qpack_blocked_streams: Option<u64>,
         dgram_sender: Option<Http3DgramSender>,
+        dgram_proxies: HashMap<u64, Option<UdpSocket>>,
         output_sink: Rc<RefCell<dyn FnMut(String)>>,
     ) -> std::result::Result<Box<dyn HttpConn>, String> {
         let h3_conn = quiche::h3::Connection::with_transport(
@@ -881,6 +897,7 @@ impl Http3Conn {
             sent_body_bytes: HashMap::new(),
             dump_json: false,
             dgram_sender,
+            dgram_proxies,
             output_sink,
         };
 
@@ -897,6 +914,7 @@ impl Http3Conn {
         let mut host = None;
         let mut path = None;
         let mut method = None;
+        let mut protocol = None;
         let mut priority = vec![];
 
         // Parse some of the request headers.
@@ -947,10 +965,14 @@ impl Http3Conn {
                 },
 
                 b":protocol" => {
-                    return Err((
-                        H3_MESSAGE_ERROR,
-                        ":protocol not supported".to_string(),
-                    ));
+                    if protocol.is_some() {
+                        return Err((
+                            H3_MESSAGE_ERROR,
+                            ":protocol cannot be duplicated".to_string(),
+                        ));
+                    }
+
+                    protocol = Some(std::str::from_utf8(hdr.value()).unwrap())
                 },
 
                 b"priority" => priority = hdr.value().to_vec(),
@@ -964,34 +986,35 @@ impl Http3Conn {
         let decided_method = match method {
             Some(method) => {
                 match method {
-                    "" =>
+                    "" => {
                         return Err((
                             H3_MESSAGE_ERROR,
                             ":method value cannot be empty".to_string(),
-                        )),
-
-                    "CONNECT" => {
-                        // not allowed
-                        let headers = vec![
-                            quiche::h3::Header::new(
-                                b":status",
-                                "405".to_string().as_bytes(),
-                            ),
-                            quiche::h3::Header::new(b"server", b"quiche"),
-                        ];
-
-                        return Ok((headers, b"".to_vec(), Default::default()));
+                        ))
                     },
 
+                    // "CONNECT" => {
+                    //     // not allowed
+                    //     let headers = vec![
+                    //         quiche::h3::Header::new(
+                    //             b":status",
+                    //             "405".to_string().as_bytes(),
+                    //         ),
+                    //         quiche::h3::Header::new(b"server", b"quiche"),
+                    //     ];
+
+                    //     return Ok((headers, b"".to_vec(), Default::default()));
+                    // },
                     _ => method,
                 }
             },
 
-            None =>
+            None => {
                 return Err((
                     H3_MESSAGE_ERROR,
                     ":method cannot be missing".to_string(),
-                )),
+                ))
+            },
         };
 
         let decided_scheme = match scheme {
@@ -1009,63 +1032,109 @@ impl Http3Conn {
                         headers,
                         b"Invalid scheme".to_vec(),
                         Default::default(),
+                        None,
                     ));
                 }
 
                 scheme
             },
 
-            None =>
+            None => {
                 return Err((
                     H3_MESSAGE_ERROR,
                     ":scheme cannot be missing".to_string(),
-                )),
+                ))
+            },
         };
 
         let decided_host = match (authority, host) {
-            (None, Some("")) =>
+            (None, Some("")) => {
                 return Err((
                     H3_MESSAGE_ERROR,
                     "host value cannot be empty".to_string(),
-                )),
+                ))
+            },
 
-            (Some(""), None) =>
+            (Some(""), None) => {
                 return Err((
                     H3_MESSAGE_ERROR,
                     ":authority value cannot be empty".to_string(),
-                )),
+                ))
+            },
 
-            (Some(""), Some("")) =>
+            (Some(""), Some("")) => {
                 return Err((
                     H3_MESSAGE_ERROR,
                     ":authority and host value cannot be empty".to_string(),
-                )),
+                ))
+            },
 
-            (None, None) =>
+            (None, None) => {
                 return Err((
                     H3_MESSAGE_ERROR,
                     ":authority and host missing".to_string(),
-                )),
+                ))
+            },
 
             // Any other combo, prefer :authority
             (..) => authority.unwrap(),
         };
 
         let decided_path = match path {
-            Some("") =>
+            Some("") => {
                 return Err((
                     H3_MESSAGE_ERROR,
                     ":path value cannot be empty".to_string(),
-                )),
+                ))
+            },
 
-            None =>
+            None => {
                 return Err((
                     H3_MESSAGE_ERROR,
                     ":path cannot be missing".to_string(),
-                )),
+                ))
+            },
 
             Some(path) => path,
         };
+
+        // Create a dgram_proxy if the request match RFC 9298 CONNECT-UDP
+        let dgram_proxy =
+            match (decided_method, protocol, decided_scheme, decided_path) {
+                ("CONNECT", Some("connect-udp"), "https", decided_path) => {
+                    match decided_path
+                        .split("/")
+                        .collect::<Vec<&str>>()
+                        .as_slice()
+                    {
+                        ["masque", "udp", host, port] => {
+                            match Http3DgramProxy::with_host_port(host, port) {
+                                Ok(proxy) => Some(proxy),
+
+                                Err(e) => {
+                                    error!(
+                                        "failed to create dgram proxy {:?}",
+                                        e
+                                    );
+                                    return Err((
+                                        H3_MESSAGE_ERROR,
+                                        "failed to create dgram proxy"
+                                            .to_string(),
+                                    ));
+                                },
+                            }
+                        },
+
+                        _ => return Err((
+                            H3_MESSAGE_ERROR,
+                            ":path value does not meet with CONNECT requirements"
+                                .to_string(),
+                        )),
+                    }
+                },
+
+                _ => None,
+            };
 
         let url = format!("{decided_scheme}://{decided_host}{decided_path}");
         let url = url::Url::parse(&url).unwrap();
@@ -1096,6 +1165,8 @@ impl Http3Conn {
                 }
             },
 
+            "CONNECT" => (200, Vec::new()),
+
             _ => (405, Vec::new()),
         };
 
@@ -1108,7 +1179,7 @@ impl Http3Conn {
             ),
         ];
 
-        Ok((headers, body, priority))
+        Ok((headers, body, priority, dgram_proxy))
     }
 }
 
@@ -1157,6 +1228,22 @@ impl HttpConn for Http3Conn {
             req.stream_id = Some(s);
             req.response_writer =
                 make_resource_writer(&req.url, target_path, req.cardinal);
+
+            // Clears empty spots from last run.
+            self.dgram_proxies.retain(|_, socket| socket.is_some());
+
+            // Make s spot for potential UDP socket, but do not listen until accepted.
+            if req
+                .hdrs
+                .contains(&quiche::h3::Header::new(b"protocol", b"connect-udp"))
+            {
+                info!("Sent connect-udp request");
+                let old = self.dgram_proxies.insert(s, None);
+                old.map_or((), |_| {
+                    error!("a dgram proxy already exist for stream id {s}")
+                });
+            }
+
             self.sent_body_bytes.insert(s, 0);
 
             reqs_done += 1;
@@ -1233,6 +1320,43 @@ impl HttpConn for Http3Conn {
                         .find(|r| r.stream_id == Some(stream_id))
                         .unwrap();
 
+                    // Confirm the udp-connect
+                    if self.dgram_proxies.contains_key(&stream_id) {
+                        // Get status code
+                        let filtered: Vec<&quiche::h3::Header> = list
+                            .iter()
+                            .filter_map(|hdr| match (hdr.name(), hdr.value()) {
+                                (b"status", b"200") => Some(hdr),
+                                _ => None,
+                            })
+                            .collect();
+                        if filtered.len() == 1 {
+                            info!("Confirming connect-udp request for stream_id {stream_id}");
+                            // TODO: make socket address configurable.
+                            let socket = match UdpSocket::bind(
+                                "127.0.0.1:0".parse().ok().unwrap(),
+                            ) {
+                                Ok(v) => {
+                                    info!(
+                                        "HTTP CONNECT listening at udp://{:?}",
+                                        v.local_addr()
+                                    );
+                                    Some(v)
+                                },
+                                Err(e) => {
+                                    error!(
+                                        "bind to local failed with error {:?}",
+                                        e
+                                    );
+                                    None
+                                },
+                            };
+                            let _ = self
+                                .dgram_proxies
+                                .insert(stream_id.clone(), socket);
+                        }
+                    };
+
                     req.response_hdrs = list;
                 },
 
@@ -1262,14 +1386,15 @@ impl HttpConn for Http3Conn {
                                 rw.write_all(&buf[..read]).ok();
                             },
 
-                            None =>
+                            None => {
                                 if !self.dump_json {
                                     self.output_sink.borrow_mut()(unsafe {
                                         String::from_utf8_unchecked(
                                             buf[..read].to_vec(),
                                         )
                                     });
-                                },
+                                }
+                            },
                         }
                     }
                 },
@@ -1356,13 +1481,98 @@ impl HttpConn for Http3Conn {
         // Process datagram-related events.
         while let Ok(len) = conn.dgram_recv(buf) {
             let mut b = octets::Octets::with_slice(buf);
-            if let Ok(flow_id) = b.get_varint() {
-                info!(
-                    "Received DATAGRAM flow_id={} len={} data={:?}",
-                    flow_id,
-                    len,
-                    buf[b.off()..len].to_vec()
-                );
+            let flow_id = match b.get_varint() {
+                Ok(flow_id) => {
+                    info!(
+                        "Received DATAGRAM flow_id={} len={} data={:?}",
+                        flow_id,
+                        len,
+                        buf[b.off()..len].to_vec()
+                    );
+                    flow_id
+                },
+
+                Err(e) => {
+                    error!("failed to get flow_id {:?}", e);
+                    break;
+                },
+            };
+
+            let dgram_proxy = match self.dgram_proxies.get(&(flow_id * 4)) {
+                Some(Some(dgram_proxy)) => dgram_proxy,
+
+                _ => {
+                    warn!("failed to find dgram_proxy for flow_id {flow_id}");
+                    continue;
+                },
+            };
+
+            match dgram_proxy.send(&buf[b.off()..len]) {
+                Ok(len) => info!(
+                    "Proxied DATAGRAM flow_id={} target=TODO len={}",
+                    flow_id, len,
+                ),
+
+                Err(e) => {
+                    error!(
+                        "Failed to proxy DATAGRAM flow_id={} target=TODO error={:?}",
+                        flow_id,
+                        e,
+                    );
+
+                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                        if let Err(e) = conn.stream_shutdown(
+                            flow_id * 4,
+                            quiche::Shutdown::Write,
+                            0x0,
+                        ) {
+                            error!("failed to shutdown stream {:?}", e);
+                        }
+                    }
+                },
+            }
+        }
+
+        for (stream_id, dgram_proxy) in self.dgram_proxies.iter_mut() {
+            if let Some(dgram_proxy) = dgram_proxy {
+                let len = match dgram_proxy.recv(buf) {
+                    Ok(len) => len,
+
+                    Err(e) => {
+                        error!(
+                        "Failed to receive from client flow_id={} target=TODO error={:?}",
+                        stream_id/4,
+                        e,
+                    );
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            if let Err(e) = conn.stream_shutdown(
+                                *stream_id,
+                                quiche::Shutdown::Read,
+                                0x0,
+                            ) {
+                                error!("failed to shutdown stream {:?}", e);
+                            };
+                        }
+                        continue;
+                    },
+                };
+
+                match send_h3_dgram(conn, *stream_id / 4, &buf[..len]) {
+                    Ok(()) => info!(
+                        "Proxied DATAGRAM flow_id={} target=TODO len={}",
+                        stream_id / 4,
+                        len,
+                    ),
+
+                    Err(e) => {
+                        error!(
+                        "Failed to proxy DATAGRAM flow_id={} target=TODO error={:?}",
+                        stream_id/4,
+                        e,
+                    );
+                        break;
+                    },
+                }
             }
         }
     }
@@ -1389,7 +1599,8 @@ impl HttpConn for Http3Conn {
     fn handle_requests(
         &mut self, conn: &mut quiche::Connection,
         _partial_requests: &mut HashMap<u64, PartialRequest>,
-        partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
+        partial_responses: &mut HashMap<u64, PartialResponse>,
+        connect_proxies: &mut HashMap<u64, Http3DgramProxy>, root: &str,
         index: &str, buf: &mut [u8],
     ) -> quiche::h3::Result<()> {
         // Process HTTP stream-related events.
@@ -1413,7 +1624,7 @@ impl HttpConn for Http3Conn {
                     conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
                         .unwrap();
 
-                    let (mut headers, body, mut priority) =
+                    let (mut headers, body, mut priority, dgram_proxy) =
                         match Http3Conn::build_h3_response(root, index, &list) {
                             Ok(v) => v,
 
@@ -1427,6 +1638,10 @@ impl HttpConn for Http3Conn {
                                 continue;
                             },
                         };
+
+                    if let Some(proxy) = dgram_proxy {
+                        connect_proxies.insert(stream_id, proxy);
+                    }
 
                     match self.h3_conn.take_last_priority_update(stream_id) {
                         Ok(v) => {
@@ -1550,16 +1765,110 @@ impl HttpConn for Http3Conn {
             }
         }
 
+        // Remove proxies for finished streams.
+        connect_proxies.retain(|stream_id, _| !conn.stream_finished(*stream_id));
+
         // Process datagram-related events.
         while let Ok(len) = conn.dgram_recv(buf) {
             let mut b = octets::Octets::with_slice(buf);
-            if let Ok(flow_id) = b.get_varint() {
-                info!(
-                    "Received DATAGRAM flow_id={} len={} data={:?}",
-                    flow_id,
+            let flow_id = match b.get_varint() {
+                Ok(flow_id) => {
+                    info!(
+                        "Received DATAGRAM flow_id={} len={} data={:?}",
+                        flow_id, // flow_id is stream_id divided by 4
+                        len,
+                        buf[b.off()..len].to_vec()
+                    );
+                    flow_id
+                },
+
+                Err(e) => {
+                    error!("failed to get flow_id {:?}", e);
+                    break;
+                },
+            };
+
+            let dgram_proxy = match connect_proxies.get(&(flow_id * 4)) {
+                Some(dgram_proxy) => dgram_proxy,
+
+                None => {
+                    warn!("failed to find dgram_proxy for flow_id {}", flow_id);
+                    continue;
+                },
+            };
+
+            match dgram_proxy.send(&buf[b.off()..len]) {
+                Ok(len) => info!(
+                    "Proxied DATAGRAM flow_id={} target={} len={}",
+                    flow_id, dgram_proxy.target, len,
+                ),
+
+                Err(e) => {
+                    error!(
+                        "Failed to proxy DATAGRAM flow_id={} target={} error={:?}",
+                        flow_id,
+                        dgram_proxy.target,
+                        e,
+                    );
+
+                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                        if let Err(e) = conn.stream_shutdown(
+                            flow_id * 4,
+                            quiche::Shutdown::Write,
+                            0x0,
+                        ) {
+                            error!("failed to shutdown stream {:?}", e);
+                        }
+                    }
+                },
+            }
+        }
+
+        for (stream_id, dgram_proxy) in connect_proxies.iter_mut() {
+            let len = match dgram_proxy.recv(buf) {
+                Ok(len) => len,
+
+                Err(e) => {
+                    error!(
+                        "Failed to receive from target flow_id={} target={} error={:?}",
+                        stream_id/4,
+                        dgram_proxy.target,
+                        e,
+                    );
+                    match e.kind() {
+                        std::io::ErrorKind::WouldBlock => (),
+
+                        _ => {
+                            if let Err(e) = conn.stream_shutdown(
+                                *stream_id,
+                                quiche::Shutdown::Read,
+                                0x0,
+                            ) {
+                                error!("failed to shutdown stream {:?}", e);
+                            };
+                        },
+                    }
+                    continue;
+                },
+            };
+
+            match send_h3_dgram(conn, *stream_id / 4, &buf[..len]) {
+                Ok(()) => info!(
+                    "Reverse-proxied DATAGRAM flow_id={} target={} len={}",
+                    stream_id / 4,
+                    dgram_proxy.target,
                     len,
-                    buf[b.off()..len].to_vec()
-                );
+                ),
+
+                Err(e) => {
+                    error!(
+                        "Failed to reverse-proxy DATAGRAM flow_id={} target={} error={:?}",
+                        stream_id/4,
+                        dgram_proxy.target,
+                        e,
+                    );
+                    break;
+                },
             }
         }
 

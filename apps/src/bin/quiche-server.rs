@@ -255,8 +255,8 @@ fn main() {
 
             // Lookup a connection based on the packet's connection ID. If there
             // is no connection matching, create a new one.
-            let client = if !clients_ids.contains_key(&hdr.dcid) &&
-                !clients_ids.contains_key(&conn_id)
+            let client = if !clients_ids.contains_key(&hdr.dcid)
+                && !clients_ids.contains_key(&conn_id)
             {
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
@@ -286,6 +286,7 @@ fn main() {
                 let mut scid = [0; quiche::MAX_CONN_ID_LEN];
                 scid.copy_from_slice(&conn_id);
 
+                // Original destination connection ID
                 let mut odcid = None;
 
                 if !args.no_retry {
@@ -341,6 +342,7 @@ fn main() {
                     scid.copy_from_slice(&hdr.dcid);
                 }
 
+                // TODO(Kuroame): Maybe use clone() here?
                 let scid = quiche::ConnectionId::from_vec(scid.to_vec());
 
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
@@ -384,6 +386,7 @@ fn main() {
                     client_id,
                     partial_requests: HashMap::new(),
                     partial_responses: HashMap::new(),
+                    masque: HashMap::new(),
                     app_proto_selected: false,
                     max_datagram_size,
                     loss_rate: 0.0,
@@ -412,6 +415,8 @@ fn main() {
             };
 
             // Process potentially coalesced packets.
+            //:) After this step, all data in buf/pkt_buf is read into either stream
+            //:) buffers or datagram buffer. So we can safely reuse buf.
             let read = match client.conn.recv(pkt_buf, recv_info) {
                 Ok(v) => v,
 
@@ -425,9 +430,9 @@ fn main() {
 
             // Create a new application protocol session as soon as the QUIC
             // connection is established.
-            if !client.app_proto_selected &&
-                (client.conn.is_in_early_data() ||
-                    client.conn.is_established())
+            if !client.app_proto_selected
+                && (client.conn.is_in_early_data()
+                    || client.conn.is_established())
             {
                 // At this stage the ALPN negotiation succeeded and selected a
                 // single application protocol name. We'll use this to construct
@@ -460,6 +465,7 @@ fn main() {
                         conn_args.qpack_max_table_capacity,
                         conn_args.qpack_blocked_streams,
                         dgram_sender,
+                        HashMap::new(),
                         Rc::new(RefCell::new(stdout_sink)),
                     ) {
                         Ok(v) => Some(v),
@@ -482,20 +488,23 @@ fn main() {
                 let conn = &mut client.conn;
                 let http_conn = client.http_conn.as_mut().unwrap();
                 let partial_responses = &mut client.partial_responses;
+                let masque = &mut client.masque;
 
                 // Handle writable streams.
                 for stream_id in conn.writable() {
                     http_conn.handle_writable(conn, partial_responses, stream_id);
                 }
 
+                //:) handle_requests *recv* and *send* dgram at the same time.
                 if http_conn
                     .handle_requests(
                         conn,
                         &mut client.partial_requests,
                         partial_responses,
+                        masque,
                         &args.root,
                         &args.index,
-                        &mut buf,
+                        &mut buf, //:) udp recv buf reused as dgram recv buffer
                     )
                     .is_err()
                 {
@@ -536,16 +545,18 @@ fn main() {
                 client.conn.stats().lost as f64 / client.conn.stats().sent as f64;
             if loss_rate > client.loss_rate + 0.001 {
                 client.max_send_burst = client.max_send_burst / 4 * 3;
-                // Minimun bound of 10xMSS.
+                // Minimum bound of 10xMSS.
                 client.max_send_burst =
                     client.max_send_burst.max(client.max_datagram_size * 10);
                 client.loss_rate = loss_rate;
             }
 
+            // Make sure max_send_burst is a multiple of max_datagram_size,
+            // so that segment offload can work properly.
             let max_send_burst =
-                client.conn.send_quantum().min(client.max_send_burst) /
-                    client.max_datagram_size *
-                    client.max_datagram_size;
+                client.conn.send_quantum().min(client.max_send_burst)
+                    / client.max_datagram_size
+                    * client.max_datagram_size;
             let mut total_write = 0;
             let mut dst_info = None;
 
@@ -574,6 +585,10 @@ fn main() {
                 // Use the first packet time to send, not the last.
                 let _ = dst_info.get_or_insert(send_info);
 
+                //:) A single write can NOT exceed max_datagram_size?
+                //:) If that is true, then this makes sense to only combine
+                //:) packets that are exactly max_datagram_size. Otherwise,
+                //:) GSO will not work.
                 if write < client.max_datagram_size {
                     continue_write = true;
                     break;
@@ -699,6 +714,7 @@ fn handle_path_events(client: &mut Client) {
                     peer_addr
                 );
 
+                //:) This direct probe is OPTIONAL.
                 // Directly probe the new path.
                 client
                     .conn

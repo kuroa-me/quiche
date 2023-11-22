@@ -1,0 +1,7 @@
+{
+  "cmake.configureOnOpen": false,
+  "rust-analyzer.linkedProjects": [
+    "./apps/Cargo.toml"
+  ],
+  "cmake.sourceDirectory": "/Users/kuro/Repositio/quiche/quiche/deps/boringssl"
+}

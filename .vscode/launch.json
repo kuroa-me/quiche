@@ -1,0 +1,37 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "h3-connect-server",
+      "cargo": {
+        "args": [
+          "build",
+          "--example",
+          "h3-connect-server"
+        ]
+      },
+      "env": {
+        "RUST_LOG": "trace"
+      },
+      "args": [
+        "--cert",
+        "apps/src/bin/cert.crt",
+        "--key",
+        "apps/src/bin/cert.key",
+        "--cc-algorithm",
+        "bbr2",
+        "--dgram-proto",
+        "oneway",
+        "--http-version",
+        "HTTP/3",
+        "--dgram-count",
+        "2",
+      ]
+    }
+  ]
+}

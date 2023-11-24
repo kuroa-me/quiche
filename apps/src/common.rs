@@ -1098,6 +1098,11 @@ impl Http3Conn {
             Some(path) => path,
         };
 
+        info!(
+            "{decided_method} {:?} {decided_scheme} {decided_path}",
+            protocol
+        );
+
         // Create a dgram_proxy if the request match RFC 9298 CONNECT-UDP
         let dgram_proxy =
             match (decided_method, protocol, decided_scheme, decided_path) {
@@ -1105,11 +1110,16 @@ impl Http3Conn {
                     match decided_path
                         .split("/")
                         .collect::<Vec<&str>>()
-                        .as_slice()
+                        .as_slice()[1..] // Remove leading slash
                     {
                         ["masque", "udp", host, port] => {
                             match Http3DgramProxy::with_host_port(host, port) {
-                                Ok(proxy) => Some(proxy),
+                                Ok(proxy) => {
+                                    info!(
+                                        "creating a dgram_proxy to {host}:{port}"
+                                    );
+                                    Some(proxy)
+                                },
 
                                 Err(e) => {
                                     error!(
@@ -1125,16 +1135,26 @@ impl Http3Conn {
                             }
                         },
 
-                        _ => return Err((
+                        _ => {
+                            info!("{}", decided_path);
+                            return Err((
                             H3_MESSAGE_ERROR,
                             ":path value does not meet with CONNECT requirements"
                                 .to_string(),
-                        )),
+                        ));
+                        },
                     }
                 },
 
                 _ => None,
             };
+
+        if let Some(ref d) = dgram_proxy {
+            match d.send(b"hello") {
+                Ok(s) => info!("sent {s} bytes"),
+                Err(e) => error!("sent error {:?}", e),
+            }
+        }
 
         let url = format!("{decided_scheme}://{decided_host}{decided_path}");
         let url = url::Url::parse(&url).unwrap();
@@ -1239,7 +1259,7 @@ impl HttpConn for Http3Conn {
             {
                 info!("Sent connect-udp request");
                 let old = self.dgram_proxies.insert(s, None);
-                old.map_or((), |_| {
+                let _ = old.map_or((), |_| {
                     error!("a dgram proxy already exist for stream id {s}")
                 });
             }
@@ -1628,7 +1648,8 @@ impl HttpConn for Http3Conn {
                         match Http3Conn::build_h3_response(root, index, &list) {
                             Ok(v) => v,
 
-                            Err((error_code, _)) => {
+                            Err((error_code, error_msg)) => {
+                                warn!("Declining request with {error_code} {error_msg}");
                                 conn.stream_shutdown(
                                     stream_id,
                                     quiche::Shutdown::Write,

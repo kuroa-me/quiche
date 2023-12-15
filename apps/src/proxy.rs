@@ -111,9 +111,9 @@ impl std::convert::From<std::net::AddrParseError> for Error {
 }
 
 pub struct Http3DgramProxy {
-    socket: mio::net::UdpSocket,
+    pub socket: mio::net::UdpSocket,
     pub target: net::SocketAddr,
-    pub context_id: u64,
+    pub context_id: u16, // This is stream_id u62 divided by 4, so a u16 is enough
 }
 
 impl Http3DgramProxy {
@@ -137,7 +137,7 @@ impl Http3DgramProxy {
     pub fn with_sock_addr(target: net::SocketAddr) -> Result<Self> {
         // TODO: make the bind address configurable.
         let socket: mio::net::UdpSocket =
-            mio::net::UdpSocket::bind("0.0.0.0:0".parse()?)?;
+            mio::net::UdpSocket::bind("127.0.0.1:2244".parse()?)?;
 
         if let Err(e) = mio::net::UdpSocket::connect(&socket, target) {
             if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -166,3 +166,8 @@ impl Http3DgramProxy {
         self.socket.recv(buf)
     }
 }
+
+pub struct MasqueInfo(
+    pub u64, /* client_id */
+    pub u16, /* context_id */
+);

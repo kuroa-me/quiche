@@ -318,7 +318,7 @@ pub fn priority_from_query_string(url: &url::Url) -> Option<Priority> {
     }
 }
 
-fn send_h3_dgram(
+pub fn send_h3_dgram(
     conn: &mut quiche::Connection, flow_id: u64, dgram_content: &[u8],
 ) -> quiche::Result<()> {
     info!(
@@ -340,11 +340,14 @@ fn send_h3_dgram(
 
 pub trait HttpConn {
     fn send_requests(
-        &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
+        &mut self, conn: &mut quiche::Connection,
+        dgram_proxies: &mut HashMap<u64, Option<UdpSocket>>,
+        target_path: &Option<String>,
     );
 
     fn handle_responses(
-        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        &mut self, conn: &mut quiche::Connection, poll_registry: &mio::Registry,
+        dgram_proxies: &mut HashMap<u64, Option<UdpSocket>>, buf: &mut [u8],
         req_start: &std::time::Instant,
     );
 
@@ -354,7 +357,10 @@ pub trait HttpConn {
         &mut self, conn: &mut quiche::Connection,
         partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>,
-        connect_proxies: &mut HashMap<u64, Http3DgramProxy>, root: &str,
+        connect_proxies: &mut HashMap<u64, Http3DgramProxy>,
+        poll_registry: &mio::Registry,
+        token_masque_map: &mut HashMap<mio::Token, MasqueInfo>,
+        available_tokens: &mut Vec<usize>, client_id: &u64, root: &str,
         index: &str, buf: &mut [u8],
     ) -> quiche::h3::Result<()>;
 
@@ -449,7 +455,9 @@ impl Http09Conn {
 
 impl HttpConn for Http09Conn {
     fn send_requests(
-        &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
+        &mut self, conn: &mut quiche::Connection,
+        _dgram_proxies: &mut HashMap<u64, Option<UdpSocket>>,
+        target_path: &Option<String>,
     ) {
         let mut reqs_done = 0;
 
@@ -487,7 +495,8 @@ impl HttpConn for Http09Conn {
     }
 
     fn handle_responses(
-        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        &mut self, conn: &mut quiche::Connection, _poll_registry: &mio::Registry,
+        _dgram_proxies: &mut HashMap<u64, Option<UdpSocket>>, buf: &mut [u8],
         req_start: &std::time::Instant,
     ) {
         // Process all readable streams.
@@ -577,7 +586,10 @@ impl HttpConn for Http09Conn {
         &mut self, conn: &mut quiche::Connection,
         partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>,
-        _connect_proxies: &mut HashMap<u64, Http3DgramProxy>, root: &str,
+        _connect_proxies: &mut HashMap<u64, Http3DgramProxy>,
+        _poll_registry: &mio::Registry,
+        _token_masque_map: &mut HashMap<mio::Token, MasqueInfo>,
+        _available_tokens: &mut Vec<usize>, _client_id: &u64, root: &str,
         index: &str, buf: &mut [u8],
     ) -> quiche::h3::Result<()> {
         // Process all readable streams.
@@ -768,7 +780,6 @@ pub struct Http3Conn {
     sent_body_bytes: HashMap<u64, usize>,
     dump_json: bool,
     dgram_sender: Option<Http3DgramSender>,
-    dgram_proxies: HashMap<u64, Option<UdpSocket>>,
     output_sink: Rc<RefCell<dyn FnMut(String)>>,
 }
 
@@ -781,7 +792,6 @@ impl Http3Conn {
         qpack_max_table_capacity: Option<u64>,
         qpack_blocked_streams: Option<u64>, dump_json: Option<usize>,
         dgram_sender: Option<Http3DgramSender>,
-        dgram_proxies: HashMap<u64, Option<UdpSocket>>,
         output_sink: Rc<RefCell<dyn FnMut(String)>>,
     ) -> Box<dyn HttpConn> {
         let mut reqs = Vec::new();
@@ -862,7 +872,6 @@ impl Http3Conn {
             body: body.as_ref().map(|b| b.to_vec()),
             sent_body_bytes: HashMap::new(),
             dump_json: dump_json.is_some(),
-            dgram_proxies,
             dgram_sender,
             output_sink,
         };
@@ -875,7 +884,6 @@ impl Http3Conn {
         qpack_max_table_capacity: Option<u64>,
         qpack_blocked_streams: Option<u64>,
         dgram_sender: Option<Http3DgramSender>,
-        dgram_proxies: HashMap<u64, Option<UdpSocket>>,
         output_sink: Rc<RefCell<dyn FnMut(String)>>,
     ) -> std::result::Result<Box<dyn HttpConn>, String> {
         let h3_conn = quiche::h3::Connection::with_transport(
@@ -897,7 +905,6 @@ impl Http3Conn {
             sent_body_bytes: HashMap::new(),
             dump_json: false,
             dgram_sender,
-            dgram_proxies,
             output_sink,
         };
 
@@ -1205,7 +1212,9 @@ impl Http3Conn {
 
 impl HttpConn for Http3Conn {
     fn send_requests(
-        &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
+        &mut self, conn: &mut quiche::Connection,
+        dgram_proxies: &mut HashMap<u64, Option<UdpSocket>>,
+        target_path: &Option<String>,
     ) {
         let mut reqs_done = 0;
 
@@ -1250,15 +1259,15 @@ impl HttpConn for Http3Conn {
                 make_resource_writer(&req.url, target_path, req.cardinal);
 
             // Clears empty spots from last run.
-            self.dgram_proxies.retain(|_, socket| socket.is_some());
+            dgram_proxies.retain(|_, socket| socket.is_some());
 
             // Make s spot for potential UDP socket, but do not listen until accepted.
             if req
                 .hdrs
-                .contains(&quiche::h3::Header::new(b"protocol", b"connect-udp"))
+                .contains(&quiche::h3::Header::new(b":protocol", b"connect-udp"))
             {
                 info!("Sent connect-udp request");
-                let old = self.dgram_proxies.insert(s, None);
+                let old = dgram_proxies.insert(s, None);
                 let _ = old.map_or((), |_| {
                     error!("a dgram proxy already exist for stream id {s}")
                 });
@@ -1322,7 +1331,8 @@ impl HttpConn for Http3Conn {
     }
 
     fn handle_responses(
-        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        &mut self, conn: &mut quiche::Connection, poll_registry: &mio::Registry,
+        dgram_proxies: &mut HashMap<u64, Option<UdpSocket>>, buf: &mut [u8],
         req_start: &std::time::Instant,
     ) {
         loop {
@@ -1340,40 +1350,48 @@ impl HttpConn for Http3Conn {
                         .find(|r| r.stream_id == Some(stream_id))
                         .unwrap();
 
+                    debug!("current dgram_proxies {:?}", dgram_proxies);
+
                     // Confirm the udp-connect
-                    if self.dgram_proxies.contains_key(&stream_id) {
+                    if dgram_proxies.contains_key(&stream_id) {
                         // Get status code
                         let filtered: Vec<&quiche::h3::Header> = list
                             .iter()
                             .filter_map(|hdr| match (hdr.name(), hdr.value()) {
-                                (b"status", b"200") => Some(hdr),
+                                (b":status", b"200") => Some(hdr),
                                 _ => None,
                             })
                             .collect();
                         if filtered.len() == 1 {
                             info!("Confirming connect-udp request for stream_id {stream_id}");
                             // TODO: make socket address configurable.
-                            let socket = match UdpSocket::bind(
-                                "127.0.0.1:0".parse().ok().unwrap(),
+                            match UdpSocket::bind(
+                                "127.0.0.1:2255".parse().ok().unwrap(),
                             ) {
-                                Ok(v) => {
+                                Ok(mut v) => {
                                     info!(
                                         "HTTP CONNECT listening at udp://{:?}",
                                         v.local_addr()
                                     );
-                                    Some(v)
+                                    poll_registry
+                                        .register(
+                                            &mut v,
+                                            mio::Token(
+                                                (stream_id / 4 + 2) as usize,
+                                            ),
+                                            mio::Interest::READABLE,
+                                        )
+                                        .unwrap();
+                                    let _ = dgram_proxies
+                                        .insert(stream_id.clone(), Some(v));
                                 },
                                 Err(e) => {
                                     error!(
                                         "bind to local failed with error {:?}",
                                         e
                                     );
-                                    None
                                 },
                             };
-                            let _ = self
-                                .dgram_proxies
-                                .insert(stream_id.clone(), socket);
                         }
                     };
 
@@ -1518,7 +1536,7 @@ impl HttpConn for Http3Conn {
                 },
             };
 
-            let dgram_proxy = match self.dgram_proxies.get(&(flow_id * 4)) {
+            let dgram_proxy = match dgram_proxies.get(&(flow_id * 4)) {
                 Some(Some(dgram_proxy)) => dgram_proxy,
 
                 _ => {
@@ -1553,7 +1571,7 @@ impl HttpConn for Http3Conn {
             }
         }
 
-        for (stream_id, dgram_proxy) in self.dgram_proxies.iter_mut() {
+        for (stream_id, dgram_proxy) in dgram_proxies.iter_mut() {
             if let Some(dgram_proxy) = dgram_proxy {
                 let len = match dgram_proxy.recv(buf) {
                     Ok(len) => len,
@@ -1620,7 +1638,10 @@ impl HttpConn for Http3Conn {
         &mut self, conn: &mut quiche::Connection,
         _partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>,
-        connect_proxies: &mut HashMap<u64, Http3DgramProxy>, root: &str,
+        connect_proxies: &mut HashMap<u64, Http3DgramProxy>,
+        poll_registry: &mio::Registry,
+        token_masque_map: &mut HashMap<mio::Token, MasqueInfo>,
+        available_tokens: &mut Vec<usize>, client_id: &u64, root: &str,
         index: &str, buf: &mut [u8],
     ) -> quiche::h3::Result<()> {
         // Process HTTP stream-related events.
@@ -1660,8 +1681,24 @@ impl HttpConn for Http3Conn {
                             },
                         };
 
-                    if let Some(proxy) = dgram_proxy {
+                    let mut stream_converted = false;
+                    if let Some(mut proxy) = dgram_proxy {
+                        let token = available_tokens
+                            .pop()
+                            .ok_or(quiche::h3::Error::RequestRejected)?;
+                        poll_registry
+                            .register(
+                                &mut proxy.socket,
+                                mio::Token(token),
+                                mio::Interest::READABLE,
+                            )
+                            .unwrap();
                         connect_proxies.insert(stream_id, proxy);
+                        token_masque_map.insert(
+                            mio::Token(token),
+                            MasqueInfo(client_id.clone(), (stream_id / 4) as u16),
+                        );
+                        stream_converted = true;
                     }
 
                     match self.h3_conn.take_last_priority_update(stream_id) {
@@ -1731,6 +1768,11 @@ impl HttpConn for Http3Conn {
                         },
                     }
 
+                    if stream_converted {
+                        // Do not send body for connect-udp
+                        continue;
+                    }
+
                     let response = PartialResponse {
                         headers: None,
                         priority: None,
@@ -1786,8 +1828,16 @@ impl HttpConn for Http3Conn {
             }
         }
 
-        // Remove proxies for finished streams.
-        connect_proxies.retain(|stream_id, _| !conn.stream_finished(*stream_id));
+        // TODO: Do we need to close the proxy based on Stream Closed?
+        // // Remove proxies for finished streams.
+        // connect_proxies.retain(|stream_id, _| {
+        //     info!(
+        //         "stream {} status {:?}",
+        //         stream_id,
+        //         conn.stream_finished(*stream_id)
+        //     );
+        //     !conn.stream_finished(*stream_id)
+        // });
 
         // Process datagram-related events.
         while let Ok(len) = conn.dgram_recv(buf) {
@@ -1841,54 +1891,6 @@ impl HttpConn for Http3Conn {
                             error!("failed to shutdown stream {:?}", e);
                         }
                     }
-                },
-            }
-        }
-
-        for (stream_id, dgram_proxy) in connect_proxies.iter_mut() {
-            let len = match dgram_proxy.recv(buf) {
-                Ok(len) => len,
-
-                Err(e) => {
-                    error!(
-                        "Failed to receive from target flow_id={} target={} error={:?}",
-                        stream_id/4,
-                        dgram_proxy.target,
-                        e,
-                    );
-                    match e.kind() {
-                        std::io::ErrorKind::WouldBlock => (),
-
-                        _ => {
-                            if let Err(e) = conn.stream_shutdown(
-                                *stream_id,
-                                quiche::Shutdown::Read,
-                                0x0,
-                            ) {
-                                error!("failed to shutdown stream {:?}", e);
-                            };
-                        },
-                    }
-                    continue;
-                },
-            };
-
-            match send_h3_dgram(conn, *stream_id / 4, &buf[..len]) {
-                Ok(()) => info!(
-                    "Reverse-proxied DATAGRAM flow_id={} target={} len={}",
-                    stream_id / 4,
-                    dgram_proxy.target,
-                    len,
-                ),
-
-                Err(e) => {
-                    error!(
-                        "Failed to reverse-proxy DATAGRAM flow_id={} target={} error={:?}",
-                        stream_id/4,
-                        dgram_proxy.target,
-                        e,
-                    );
-                    break;
                 },
             }
         }

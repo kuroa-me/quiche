@@ -41,6 +41,8 @@ use std::rc::Rc;
 
 use std::cell::RefCell;
 
+use quiche_apps::proxy;
+
 use ring::rand::*;
 
 use quiche_apps::args::*;
@@ -178,6 +180,9 @@ fn main() {
 
     let local_addr = socket.local_addr().unwrap();
 
+    let mut available_token: Vec<usize> = (1..u16::MAX as usize).collect();
+    let mut token_masque_map = HashMap::<mio::Token, proxy::MasqueInfo>::new();
+
     loop {
         // Find the shorter timeout from all the active connections.
         //
@@ -202,6 +207,66 @@ fn main() {
                 clients.values_mut().for_each(|c| c.conn.on_timeout());
 
                 break 'read;
+            }
+
+            // Handle all the proxy events first.
+            for event in &events {
+                let (client_id, context_id) = match event.token() {
+                    mio::Token(0) => continue, // Do not handle QUIC socket here.
+                    n => {
+                        let proxy::MasqueInfo(client_id, context_id) =
+                            token_masque_map[&n];
+                        (client_id, context_id)
+                    },
+                };
+                let client = clients.get_mut(&client_id).unwrap();
+                let conn = &mut client.conn;
+                let masque = &mut client.masque;
+                let stream_id = context_id as u64 * 4;
+                let dgram_proxy = masque.get_mut(&stream_id).unwrap();
+                let len = match dgram_proxy.recv(&mut buf) {
+                    Ok(len) => len,
+
+                    Err(e) => {
+                        error!(
+                            "Failed to receive from target flow_id={} target={} error={:?}",
+                            context_id,
+                            dgram_proxy.target,
+                            e,
+                        );
+                        match e.kind() {
+                            std::io::ErrorKind::WouldBlock => (),
+
+                            _ => {
+                                if let Err(e) = conn.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Read,
+                                    0x0,
+                                ) {
+                                    error!("failed to shutdown stream {:?}", e);
+                                };
+                            },
+                        }
+                        continue;
+                    },
+                };
+
+                match send_h3_dgram(conn, context_id as u64, &buf[..len]) {
+                    Ok(()) => info!(
+                        "Reverse-proxied DATAGRAM flow_id={} target={} len={}",
+                        context_id, dgram_proxy.target, len,
+                    ),
+
+                    Err(e) => {
+                        error!(
+                            "Failed to reverse-proxy DATAGRAM flow_id={} target={} error={:?}",
+                            context_id,
+                            dgram_proxy.target,
+                            e,
+                        );
+                        break;
+                    },
+                }
             }
 
             let (len, from) = match socket.recv_from(&mut buf) {
@@ -465,7 +530,6 @@ fn main() {
                         conn_args.qpack_max_table_capacity,
                         conn_args.qpack_blocked_streams,
                         dgram_sender,
-                        HashMap::new(),
                         Rc::new(RefCell::new(stdout_sink)),
                     ) {
                         Ok(v) => Some(v),
@@ -502,6 +566,10 @@ fn main() {
                         &mut client.partial_requests,
                         partial_responses,
                         masque,
+                        poll.registry(),
+                        &mut token_masque_map,
+                        &mut available_token,
+                        &client.client_id,
                         &args.root,
                         &args.index,
                         &mut buf, //:) udp recv buf reused as dgram recv buffer

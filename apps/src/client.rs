@@ -249,6 +249,9 @@ pub fn connect(
     let mut new_path_probed = false;
     let mut migrated = false;
 
+    let mut dgram_proxies: HashMap<u64, Option<mio::net::UdpSocket>> =
+        HashMap::new();
+
     loop {
         if !conn.is_in_early_data() || app_proto_selected {
             poll.poll(&mut events, conn.timeout()).unwrap();
@@ -267,15 +270,62 @@ pub fn connect(
         // until there are no more packets to read.
         for event in &events {
             let socket = match event.token() {
-                mio::Token(0) => &socket,
+                mio::Token(0) => Some(&socket),
 
-                mio::Token(1) => migrate_socket.as_ref().unwrap(),
+                mio::Token(1) => migrate_socket.as_ref(),
 
-                _ => unreachable!(),
+                mio::Token(n) => {
+                    let stream_id = ((n - 2) * 4) as u64;
+                    let dgram_proxy =
+                        dgram_proxies.get(&stream_id).unwrap().as_ref().unwrap();
+                    let len = match dgram_proxy.recv(&mut buf) {
+                        Ok(len) => len,
+
+                        Err(e) => {
+                            error!(
+                                "Failed to receive from client flow_id={} target=TODO error={:?}",
+                                stream_id/4,
+                                e,
+                            );
+                            if e.kind() != std::io::ErrorKind::WouldBlock {
+                                if let Err(e) = conn.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Read,
+                                    0x0,
+                                ) {
+                                    error!("failed to shutdown stream {:?}", e);
+                                };
+                            }
+                            continue;
+                        },
+                    };
+
+                    match send_h3_dgram(&mut conn, stream_id / 4, &buf[..len]) {
+                        Ok(()) => info!(
+                            "Proxied DATAGRAM flow_id={} target=TODO len={}",
+                            stream_id / 4,
+                            len,
+                        ),
+
+                        Err(e) => {
+                            error!(
+                                "Failed to proxy DATAGRAM flow_id={} target=TODO error={:?}",
+                                stream_id/4,
+                                e,
+                            );
+                            break;
+                        },
+                    }
+                    None
+                },
             };
 
-            let local_addr = socket.local_addr().unwrap();
             'read: loop {
+                let socket = match socket {
+                    Some(s) => s,
+                    None => break 'read,
+                };
+                let local_addr = socket.local_addr().unwrap();
                 let (len, from) = match socket.recv_from(&mut buf) {
                     Ok(v) => v,
 
@@ -406,7 +456,6 @@ pub fn connect(
                     conn_args.qpack_blocked_streams,
                     args.dump_json,
                     dgram_sender,
-                    HashMap::new(),
                     Rc::clone(&output_sink),
                 ));
 
@@ -417,8 +466,18 @@ pub fn connect(
         // If we have an HTTP connection, first issue the requests then
         // process received data.
         if let Some(h_conn) = http_conn.as_mut() {
-            h_conn.send_requests(&mut conn, &args.dump_response_path);
-            h_conn.handle_responses(&mut conn, &mut buf, &app_data_start);
+            h_conn.send_requests(
+                &mut conn,
+                &mut dgram_proxies,
+                &args.dump_response_path,
+            );
+            h_conn.handle_responses(
+                &mut conn,
+                &poll.registry(),
+                &mut dgram_proxies,
+                &mut buf,
+                &app_data_start,
+            );
         }
 
         // Handle path events.

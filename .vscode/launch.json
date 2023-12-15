@@ -7,16 +7,16 @@
     {
       "type": "lldb",
       "request": "launch",
-      "name": "h3-connect-server",
+      "name": "quiche-server",
       "cargo": {
         "args": [
           "build",
-          "--example",
-          "h3-connect-server"
+          "--bin",
+          "quiche-server"
         ]
       },
       "env": {
-        "RUST_LOG": "trace"
+        "RUST_LOG": "debug"
       },
       "args": [
         "--cert",
@@ -29,8 +29,36 @@
         "oneway",
         "--http-version",
         "HTTP/3",
-        "--dgram-count",
-        "2",
+      ]
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "quiche-client",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin",
+          "quiche-client"
+        ]
+      },
+      "env": {
+        "RUST_LOG": "debug"
+      },
+      "args": [
+        "--connect-to",
+        "127.0.0.1:4433",
+        "--trust-origin-ca-pem",
+        "quiche/examples/rootca.crt",
+        "--dgram-proto",
+        "oneway",
+        "--http-version",
+        "HTTP/3",
+        "--method",
+        "CONNECT",
+        "--header",
+        ":protocol: connect-udp",
+        "https://quic.tech/masque/udp/127.0.0.1/2233",
       ]
     }
   ]
